@@ -10,6 +10,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
+import ru.anyforms.email.dto.BulkEmailRequest;
+import ru.anyforms.email.dto.BulkEmailResponse;
 import ru.anyforms.email.dto.RenderedEmailDTO;
 import ru.anyforms.email.dto.SendEmailRequest;
 import ru.anyforms.email.dto.SendEmailResponse;
@@ -24,7 +26,13 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -34,6 +42,11 @@ class EmailQueueServiceImpl implements EmailQueueService {
 
     static final Pattern CLIENT_PATTERN = Pattern.compile("[a-z0-9][a-z0-9._-]{0,99}");
     static final int MAX_KEY_LENGTH = 255;
+    static final int MAX_BULK_RECIPIENTS = 2000;
+    static final Pattern RECIPIENT_SEPARATOR = Pattern.compile("[\\s,;]+");
+    static final Pattern EMAIL_PATTERN = Pattern.compile("[^@\\s]+@[^@\\s.]+(\\.[^@\\s.]+)+");
+    private static final int MAX_EMAIL_LENGTH = 320;
+    private static final int MAX_INVALID_IN_MESSAGE = 20;
 
     private final GetterEmailMessage getterEmailMessage;
     private final SaverEmailMessage saverEmailMessage;
@@ -95,6 +108,109 @@ class EmailQueueServiceImpl implements EmailQueueService {
         log.info("Письмо {} поставлено в очередь: клиент {}, тип {}, шаблон {}",
                 message.getId(), client, message.getType(), message.getTemplateCode());
         return new SendEmailResponse(message.getId(), message.getStatus(), false);
+    }
+
+    @Override
+    @Transactional
+    public BulkEmailResponse enqueueBulk(String client, BulkEmailRequest request) {
+        validateClient(client);
+        String batchKey = request.batchKey().trim();
+        Map<String, String> recipients = parseRecipients(request.recipients());
+        String templateCode = request.templateCode().trim();
+        String fromName = blankToNull(request.fromName());
+        String replyTo = blankToNull(request.replyTo());
+
+        RenderedEmailDTO rendered = emailTemplateService.render(templateCode, request.variables());
+        Instant now = clock.instant();
+        int queued = 0;
+        for (String to : recipients.values()) {
+            String key = bulkKey(batchKey, to);
+            String hash = hash(new SendEmailRequest(request.type(), to.toLowerCase(Locale.ROOT), fromName, replyTo, templateCode,
+                    request.variables(), null, null));
+            EmailMessage message = EmailMessage.builder()
+                    .id(UUID.randomUUID())
+                    .client(client)
+                    .idempotencyKey(key)
+                    .requestHash(hash)
+                    .type(request.type())
+                    .templateCode(templateCode)
+                    .toAddress(to)
+                    .fromName(fromName)
+                    .replyTo(replyTo)
+                    .subject(rendered.subject())
+                    .html(rendered.html())
+                    .status(EmailMessageStatus.QUEUED)
+                    .nextAttemptAt(now)
+                    .createdAt(now)
+                    .updatedAt(now)
+                    .build();
+            if (saverEmailMessage.insertIfAbsent(message)) {
+                queued++;
+                continue;
+            }
+            EmailMessage existing = getterEmailMessage.getByClientAndIdempotencyKey(client, key)
+                    .orElseThrow(() -> new IllegalStateException("Письмо с ключом идемпотентности не найдено после конфликта"));
+            if (!existing.getRequestHash().equals(hash)) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT,
+                        "Рассылка " + batchKey + " уже поставлена с другим шаблоном или переменными (" + to
+                                + "). Для новой рассылки нужен новый batchKey");
+            }
+        }
+        int duplicates = recipients.size() - queued;
+        log.info("Рассылка {} от клиента {}: шаблон {}, тип {}, адресов {}, поставлено {}, уже были {}",
+                batchKey, client, templateCode, request.type(), recipients.size(), queued, duplicates);
+        return new BulkEmailResponse(batchKey, recipients.size(), queued, duplicates);
+    }
+
+    /** Адреса без повторов (без учёта регистра) в исходном порядке: ключ — адрес в нижнем регистре. */
+    static Map<String, String> parseRecipients(List<String> raw) {
+        Map<String, String> unique = new LinkedHashMap<>();
+        List<String> invalid = new ArrayList<>();
+        for (String line : raw) {
+            if (line == null) {
+                continue;
+            }
+            for (String token : RECIPIENT_SEPARATOR.split(line.trim())) {
+                String address = token.trim();
+                if (address.isEmpty()) {
+                    continue;
+                }
+                if (address.length() > MAX_EMAIL_LENGTH || !EMAIL_PATTERN.matcher(address).matches()) {
+                    invalid.add(address);
+                    continue;
+                }
+                unique.putIfAbsent(address.toLowerCase(Locale.ROOT), address);
+            }
+        }
+        if (!invalid.isEmpty()) {
+            String shown = String.join(", ", invalid.subList(0, Math.min(invalid.size(), MAX_INVALID_IN_MESSAGE)));
+            String more = invalid.size() > MAX_INVALID_IN_MESSAGE ? " и ещё " + (invalid.size() - MAX_INVALID_IN_MESSAGE) : "";
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Некорректные адреса (" + invalid.size() + "): " + shown + more + ". Ничего не отправлено");
+        }
+        if (unique.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Укажите хотя бы один адрес получателя");
+        }
+        if (unique.size() > MAX_BULK_RECIPIENTS) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "За раз можно не больше " + MAX_BULK_RECIPIENTS + " адресов, передано " + unique.size());
+        }
+        return unique;
+    }
+
+    /** Ключ письма рассылки: batchKey + адрес; длинный адрес заменяется хэшем, чтобы ключ влез в 255 символов. */
+    static String bulkKey(String batchKey, String to) {
+        String address = to.toLowerCase(Locale.ROOT);
+        String key = "bulk:" + batchKey + ":" + address;
+        if (key.length() <= MAX_KEY_LENGTH) {
+            return key;
+        }
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(address.getBytes(StandardCharsets.UTF_8));
+            return "bulk:" + batchKey + ":#" + HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("Не получилось посчитать хэш адреса", e);
+        }
     }
 
     private SendEmailResponse duplicate(EmailMessage existing, String hash) {
