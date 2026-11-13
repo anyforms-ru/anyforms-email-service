@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
+import ru.anyforms.email.dto.BulkEmailRequest;
+import ru.anyforms.email.dto.BulkEmailResponse;
 import ru.anyforms.email.dto.RenderedEmailDTO;
 import ru.anyforms.email.dto.SendEmailRequest;
 import ru.anyforms.email.dto.SendEmailResponse;
@@ -18,6 +20,7 @@ import ru.anyforms.email.service.EmailTemplateService;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -27,7 +30,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -139,5 +145,68 @@ class EmailQueueServiceImplTest {
         assertEquals(HttpStatus.BAD_REQUEST, assertThrows(ResponseStatusException.class,
                 () -> service.enqueue(CLIENT, KEY, new SendEmailRequest(EmailType.SYSTEM, "a@b.ru", null, null, "t", null, "s", "<p/>"))).getStatusCode());
         verify(saver, never()).insertIfAbsent(any());
+    }
+
+    private static BulkEmailRequest bulk(String... recipients) {
+        return new BulkEmailRequest("promo-1", EmailType.MARKETING, "promo", Map.of("name", "друг"),
+                null, null, List.of(recipients));
+    }
+
+    @Test
+    void bulkQueuesEveryUniqueAddressOnce() {
+        when(templates.render("promo", Map.of("name", "друг"))).thenReturn(new RenderedEmailDTO("Скидка", "<p>друг</p>"));
+
+        BulkEmailResponse response = service.enqueueBulk(CLIENT, bulk("a@b.ru, C@d.ru;\n c@D.ru  e@f.com"));
+
+        ArgumentCaptor<EmailMessage> captor = ArgumentCaptor.forClass(EmailMessage.class);
+        verify(saver, times(3)).insertIfAbsent(captor.capture());
+        verify(templates, times(1)).render(anyString(), any());
+        assertEquals(new BulkEmailResponse("promo-1", 3, 3, 0), response);
+        assertEquals(List.of("a@b.ru", "C@d.ru", "e@f.com"),
+                captor.getAllValues().stream().map(EmailMessage::getToAddress).toList());
+        EmailMessage first = captor.getAllValues().get(0);
+        assertEquals("bulk:promo-1:a@b.ru", first.getIdempotencyKey());
+        assertEquals(EmailType.MARKETING, first.getType());
+        assertEquals("promo", first.getTemplateCode());
+        assertEquals("Скидка", first.getSubject());
+        assertEquals(EmailMessageStatus.QUEUED, first.getStatus());
+    }
+
+    @Test
+    void bulkRejectsWholeListWithInvalidAddress() {
+        ResponseStatusException e = assertThrows(ResponseStatusException.class,
+                () -> service.enqueueBulk(CLIENT, bulk("a@b.ru, not-an-email, x@y")));
+
+        assertEquals(HttpStatus.BAD_REQUEST, e.getStatusCode());
+        assertTrue(e.getReason().contains("not-an-email"));
+        assertTrue(e.getReason().contains("x@y"));
+        verify(saver, never()).insertIfAbsent(any());
+        verify(templates, never()).render(anyString(), any());
+    }
+
+    @Test
+    void bulkRepeatCountsDuplicatesAndConflictsOnChangedContent() {
+        when(templates.render(eq("promo"), any())).thenReturn(new RenderedEmailDTO("Скидка", "<p>x</p>"));
+        ArgumentCaptor<EmailMessage> captor = ArgumentCaptor.forClass(EmailMessage.class);
+        service.enqueueBulk(CLIENT, bulk("a@b.ru"));
+        verify(saver).insertIfAbsent(captor.capture());
+        EmailMessage stored = captor.getValue();
+
+        when(saver.insertIfAbsent(any())).thenReturn(false);
+        when(getter.getByClientAndIdempotencyKey(CLIENT, "bulk:promo-1:a@b.ru")).thenReturn(Optional.of(stored));
+        assertEquals(new BulkEmailResponse("promo-1", 1, 0, 1), service.enqueueBulk(CLIENT, bulk("A@B.ru")));
+
+        BulkEmailRequest changed = new BulkEmailRequest("promo-1", EmailType.MARKETING, "promo", Map.of("name", "другой"),
+                null, null, List.of("a@b.ru"));
+        ResponseStatusException e = assertThrows(ResponseStatusException.class, () -> service.enqueueBulk(CLIENT, changed));
+        assertEquals(HttpStatus.CONFLICT, e.getStatusCode());
+    }
+
+    @Test
+    void bulkKeyFitsColumnForLongAddress() {
+        String longAddress = "a".repeat(240) + "@example.com";
+        String key = EmailQueueServiceImpl.bulkKey("promo-1", longAddress);
+        assertTrue(key.length() <= EmailQueueServiceImpl.MAX_KEY_LENGTH);
+        assertEquals(key, EmailQueueServiceImpl.bulkKey("promo-1", longAddress.toUpperCase()));
     }
 }

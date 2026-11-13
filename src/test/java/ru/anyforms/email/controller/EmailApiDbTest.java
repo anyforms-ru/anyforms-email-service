@@ -117,4 +117,40 @@ class EmailApiDbTest {
                         .content("{\"fromAddress\":\"not-an-email\"}"))
                 .andExpect(status().isBadRequest());
     }
+
+    @Test
+    void bulkQueuesAllInOneTransaction() throws Exception {
+        mvc.perform(put("/api/v1/templates/promo").contentType(MediaType.APPLICATION_JSON)
+                        .header("X-Auth-Token", "test-token")
+                        .content("{\"subject\":\"Скидка {{percent}}%\",\"html\":\"<p>{{percent}}</p>\"}"))
+                .andExpect(status().isOk());
+
+        String body = """
+                {"batchKey":"b1","type":"MARKETING","templateCode":"promo","variables":{"percent":"10"},
+                 "recipients":["a@b.ru, c@d.ru; A@B.ru"]}
+                """;
+        for (int i = 0; i < 2; i++) {
+            mvc.perform(post("/api/v1/emails/bulk").contentType(MediaType.APPLICATION_JSON).content(body)
+                            .header("X-Auth-Token", "test-token").header("X-Client-Id", "anyforms-back"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.total").value(2))
+                    .andExpect(jsonPath("$.queued").value(i == 0 ? 2 : 0))
+                    .andExpect(jsonPath("$.duplicates").value(i == 0 ? 0 : 2));
+        }
+        assertEquals(2, jdbcTemplate.queryForObject(
+                "select count(*) from email_message where status = 'QUEUED' and subject = 'Скидка 10%'", Integer.class));
+
+        mvc.perform(post("/api/v1/emails/bulk").contentType(MediaType.APPLICATION_JSON)
+                        .content(body.replace("b1", "b2").replace("c@d.ru", "x@y.ru, e@f.ru").replace("\"10\"", "\"20\""))
+                        .header("X-Auth-Token", "test-token").header("X-Client-Id", "anyforms-back"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.queued").value(3));
+
+        // Второй адрес из b1 с другими переменными — конфликт, и новый адрес x2 из этого же запроса не остаётся в очереди
+        mvc.perform(post("/api/v1/emails/bulk").contentType(MediaType.APPLICATION_JSON)
+                        .content(body.replace("a@b.ru, c@d.ru", "x2@y.ru, a@b.ru, c@d.ru").replace("\"10\"", "\"30\""))
+                        .header("X-Auth-Token", "test-token").header("X-Client-Id", "anyforms-back"))
+                .andExpect(status().isConflict());
+        assertEquals(5, jdbcTemplate.queryForObject("select count(*) from email_message", Integer.class));
+    }
 }
